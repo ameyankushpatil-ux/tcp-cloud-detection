@@ -7,3 +7,27 @@ backups/
 *.bak
 *.backup
 .streamlit/secrets.toml
+
+# Uploaded PCAP/PCAPNG files - do not publish network captures
+uploads/
+*.pcap
+*.pcapng
+
+# Generated evaluation output
+output/
+*.csv.tmp
+
+# Python virtual environments and caches
+venv/
+ENV/
+
+# Temporary files
+*.tmp
+*.log
+
+# Local agent configuration
+.agents/
+
+# Include prepared synthetic datasets for reproducible evaluation
+!datasets/*.pcap
+!datasets/*.pcapng

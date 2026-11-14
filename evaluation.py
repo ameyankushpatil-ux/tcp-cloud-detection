@@ -1,72 +1,59 @@
+"""Evaluation helpers for the TCP PCAP detection prototype.
+
+The uploaded PCAP is evaluated directly. A ground-truth label must be
+provided by the analyst because a PCAP file does not contain its own label.
+"""
+
 import pandas as pd
-from sklearn.metrics import (
-    confusion_matrix,
-    classification_report,
-    precision_score,
-    recall_score,
-    f1_score
-)
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 
-from detection.tcp_analyzer import (
-    analyze_pcap,
-    detect_patterns
-)
 
-datasets = {
-    "legitimate.pcap": 0,
-    "syn_burst.pcap": 1,
-    "port_scan.pcap": 1,
-    "retransmission.pcap": 1
-}
+def evaluate_prediction(filename, alerts, ground_truth):
+    """Evaluate one analysed PCAP against its analyst-provided ground truth.
 
-y_true = []
-y_pred = []
+    Args:
+        filename: Name of the PCAP file analysed by the dashboard.
+        alerts: Alerts returned by detection.tcp_analyzer.detect_patterns.
+        ground_truth: 0 for Benign, 1 for Malicious/Suspicious.
 
-results = []
-
-for filename, label in datasets.items():
-
-    df = analyze_pcap(f"datasets/{filename}")
-    alerts = detect_patterns(df)
-
+    Returns:
+        (results_dataframe, metrics_dict)
+    """
     prediction = int(len(alerts) > 0)
+    y_true = [int(ground_truth)]
+    y_pred = [prediction]
 
-    y_true.append(label)
-    y_pred.append(prediction)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    accuracy = (tp + tn) / (tp + tn + fp + fn)
+    fpr = fp / (fp + tn) if (fp + tn) else 0.0
 
-    results.append({
-        "Dataset": filename,
-        "Ground Truth": "Malicious" if label else "Benign",
-        "Prediction": "Malicious" if prediction else "Benign",
-        "Alerts": len(alerts),
-        "Result": "Correct" if label == prediction else "Incorrect"
-    })
+    metrics = {
+        "accuracy": accuracy,
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1": f1_score(y_true, y_pred, zero_division=0),
+        "fpr": fpr,
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+        "prediction": prediction,
+        "ground_truth": int(ground_truth),
+    }
 
-print("\nDETECTION EVALUATION RESULTS")
-print("=" * 60)
+    results = pd.DataFrame([{
+        "PCAP File": filename,
+        "Ground Truth": "Malicious/Suspicious" if ground_truth else "Benign",
+        "Predicted Class": "Malicious/Suspicious" if prediction else "Benign",
+        "Detection Alerts": len(alerts),
+        "Verdict": "Correct" if prediction == ground_truth else "Incorrect",
+    }])
 
-print(pd.DataFrame(results).to_string(index=False))
+    return results, metrics
 
-print("\nCONFUSION MATRIX")
-print(confusion_matrix(y_true, y_pred, labels=[0, 1]))
 
-print("\nPERFORMANCE METRICS")
-print("Precision:", precision_score(y_true, y_pred, zero_division=0))
-print("Recall:", recall_score(y_true, y_pred, zero_division=0))
-print("F1 Score:", f1_score(y_true, y_pred, zero_division=0))
-
-tn, fp, fn, tp = confusion_matrix(
-    y_true, y_pred, labels=[0, 1]
-).ravel()
-
-fpr = fp / (fp + tn) if (fp + tn) else 0
-
-print("False Positive Rate:", fpr)
-
-print("\nCLASSIFICATION REPORT")
-print(classification_report(
-    y_true,
-    y_pred,
-    target_names=["Benign", "Malicious"],
-    zero_division=0
-))
+if __name__ == "__main__":
+    print(
+        "This module is used by app.py to evaluate the currently uploaded PCAP. "
+        "Run the Streamlit application and upload a PCAP to evaluate it."
+    )

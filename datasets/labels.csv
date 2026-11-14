@@ -1,0 +1,5 @@
+filename,ground_truth,scenario
+legitimate.pcap,0,Legitimate TCP
+syn_burst.pcap,1,SYN Burst
+port_scan.pcap,1,Port Scan
+retransmission.pcap,1,Repeated SYN

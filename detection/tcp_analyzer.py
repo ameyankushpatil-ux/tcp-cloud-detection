@@ -1,5 +1,4 @@
-from collections import defaultdict
-from scapy.all import rdpcap, IP, TCP
+from scapy.all import PcapReader, IP, IPv6, TCP, UDP
 import pandas as pd
 
 
@@ -12,39 +11,176 @@ HANDSHAKE_TIMEOUT = 30
 
 
 def analyze_pcap(file_path):
-    packets = rdpcap(file_path)
+    """
+    Stream a PCAP/PCAPNG file and extract IPv4/IPv6 TCP and UDP traffic.
+    TCP records retain the fields required by the detection engine.
+    """
+
     records = []
 
-    for pkt in packets:
-        if IP not in pkt or TCP not in pkt:
-            continue
+    try:
+        with PcapReader(str(file_path)) as packets:
+            for pkt in packets:
 
-        ip = pkt[IP]
-        tcp = pkt[TCP]
-        flags = int(tcp.flags)
+                if IP in pkt:
+                    ip = pkt[IP]
+                    src_ip = ip.src
+                    dst_ip = ip.dst
+                    ip_version = 4
 
-        records.append({
-            "timestamp": float(pkt.time),
-            "src_ip": ip.src,
-            "dst_ip": ip.dst,
-            "src_port": int(tcp.sport),
-            "dst_port": int(tcp.dport),
-            "flags": flags,
-            "seq": int(tcp.seq),
-            "ack": int(tcp.ack),
-            "syn": bool(flags & 0x02),
-            "ack_flag": bool(flags & 0x10),
-            "rst": bool(flags & 0x04),
-            "fin": bool(flags & 0x01),
-        })
+                elif IPv6 in pkt:
+                    ip = pkt[IPv6]
+                    src_ip = ip.src
+                    dst_ip = ip.dst
+                    ip_version = 6
 
-    return pd.DataFrame(records).sort_values(
+                else:
+                    continue
+
+                timestamp = float(pkt.time)
+
+                if TCP in pkt:
+                    transport = pkt[TCP]
+                    protocol = "TCP"
+                    flags = int(transport.flags)
+
+                    records.append({
+                        "timestamp": timestamp,
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "src_port": int(transport.sport),
+                        "dst_port": int(transport.dport),
+                        "protocol": protocol,
+                        "ip_version": ip_version,
+                        "flags": flags,
+                        "seq": int(transport.seq),
+                        "ack": int(transport.ack),
+                        "syn": bool(flags & 0x02),
+                        "ack_flag": bool(flags & 0x10),
+                        "rst": bool(flags & 0x04),
+                        "fin": bool(flags & 0x01),
+                    })
+
+                elif UDP in pkt:
+                    transport = pkt[UDP]
+
+                    records.append({
+                        "timestamp": timestamp,
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "src_port": int(transport.sport),
+                        "dst_port": int(transport.dport),
+                        "protocol": "UDP",
+                        "ip_version": ip_version,
+                        "flags": 0,
+                        "seq": 0,
+                        "ack": 0,
+                        "syn": False,
+                        "ack_flag": False,
+                        "rst": False,
+                        "fin": False,
+                    })
+
+    except Exception as exc:
+        raise ValueError(
+            f"Unable to read PCAP/PCAPNG file: {exc}"
+        ) from exc
+
+    columns = [
+        "timestamp", "src_ip", "dst_ip",
+        "src_port", "dst_port", "protocol",
+        "ip_version", "flags", "seq", "ack",
+        "syn", "ack_flag", "rst", "fin"
+    ]
+
+    return pd.DataFrame(records, columns=columns).sort_values(
         "timestamp"
     ).reset_index(drop=True)
 
 
+def _tcp_only(df):
+    """Return TCP rows while supporting legacy test DataFrames."""
+    if "protocol" in df.columns:
+        return df[df["protocol"] == "TCP"].copy()
+    return df.copy()
+
+
+def _analyze_handshakes(df):
+    """Correlate TCP SYN, SYN-ACK and final ACK packets."""
+
+    sessions = {}
+
+    df = _tcp_only(df)
+
+    if df.empty:
+        return sessions
+
+    for row in df.sort_values("timestamp").to_dict("records"):
+        key = (
+            row["src_ip"], row["dst_ip"],
+            row["src_port"], row["dst_port"]
+        )
+
+        reverse = (
+            row["dst_ip"], row["src_ip"],
+            row["dst_port"], row["src_port"]
+        )
+
+        # Initial SYN, including SYN packets with ECN flags
+        if row["syn"] and not row["ack_flag"]:
+            session_key = (key, row["seq"])
+
+            if session_key not in sessions:
+                sessions[session_key] = {
+                    "syn_time": row["timestamp"],
+                    "last_syn_time": row["timestamp"],
+                    "syn_seq": row["seq"],
+                    "synack_time": None,
+                    "synack_seq": None,
+                    "completed": False,
+                }
+            else:
+                # Retransmission: update observation time,
+                # but do not create another connection.
+                sessions[session_key]["last_syn_time"] = max(
+                    sessions[session_key]["last_syn_time"],
+                    row["timestamp"]
+                )
+
+        # SYN-ACK: reverse tuple and matching acknowledgement
+        elif row["syn"] and row["ack_flag"]:
+            original_syn_seq = row["ack"] - 1
+            session_key = (reverse, original_syn_seq)
+            flow = sessions.get(session_key)
+
+            if (
+                flow
+                and row["timestamp"] >= flow["syn_time"]
+                and flow["synack_time"] is None
+            ):
+                flow["synack_time"] = row["timestamp"]
+                flow["synack_seq"] = row["seq"]
+
+        # Final ACK: match original tuple and both sequence numbers
+        elif row["ack_flag"] and not row["syn"]:
+            original_syn_seq = row["seq"] - 1
+            session_key = (key, original_syn_seq)
+            flow = sessions.get(session_key)
+
+            if (
+                flow
+                and flow["synack_time"] is not None
+                and row["timestamp"] >= flow["synack_time"]
+                and row["ack"] == flow["synack_seq"] + 1
+            ):
+                flow["completed"] = True
+
+    return sessions
+
+
 def detect_patterns(df):
     alerts = []
+    df = _tcp_only(df)
 
     if df.empty:
         return alerts
@@ -107,79 +243,41 @@ def detect_patterns(df):
                 })
                 break
 
-    # 3. TCP three-way handshake correlation
-    flows = {}
+    # 3. TCP handshake analysis
+    sessions = _analyze_handshakes(df)
+    capture_end = df["timestamp"].max()
 
-    for row in df.to_dict("records"):
-        key = (
-            row["src_ip"], row["dst_ip"],
-            row["src_port"], row["dst_port"]
-        )
-
-        reverse = (
-            row["dst_ip"], row["src_ip"],
-            row["dst_port"], row["src_port"]
-        )
-
-        if row["syn"] and not row["ack_flag"]:
-            flows.setdefault(key, {
-                "syn_time": row["timestamp"],
-                "syn_seq": row["seq"],
-                "synack_time": None,
-                "synack_seq": None,
-                "completed": False,
-            })
-
-        elif row["syn"] and row["ack_flag"]:
-            flow = flows.get(reverse)
-
-            if (
-                flow
-                and row["ack"] == flow["syn_seq"] + 1
-                and flow["synack_time"] is None
-            ):
-                flow["synack_time"] = row["timestamp"]
-                flow["synack_seq"] = row["seq"]
-
-        elif row["ack_flag"] and not row["syn"]:
-            flow = flows.get(key)
-
-            if (
-                flow
-                and flow["synack_time"] is not None
-                and row["timestamp"] >= flow["synack_time"]
-                and row["seq"] == flow["syn_seq"] + 1
-                and row["ack"] == flow["synack_seq"] + 1
-            ):
-                flow["completed"] = True
-
-    completed = sum(
-        1 for flow in flows.values() if flow["completed"]
-    )
-
-    total = len(flows)
-    incomplete = total - completed
-
-    for key, flow in flows.items():
+    for (key, syn_seq), flow in sessions.items():
         if flow["completed"]:
             continue
 
-        elapsed = (
-            df["timestamp"].max() - flow["syn_time"]
-        )
+        # Wait until sufficient time has elapsed since
+        # the most recently observed SYN.
+        elapsed = capture_end - flow["last_syn_time"]
 
-        # Only flag when capture has enough observation time
-        if elapsed >= HANDSHAKE_TIMEOUT:
-            alerts.append({
-                "source": key[0],
-                "type": "Incomplete Handshake",
-                "severity": "MEDIUM",
-                "confidence": "MEDIUM",
-                "evidence": (
-                    f"No complete handshake observed for "
-                    f"{key[1]}:{key[3]}"
-                )
-            })
+        if elapsed < HANDSHAKE_TIMEOUT:
+            continue
+
+        if flow["synack_time"] is None:
+            alert_type = "Unanswered SYN"
+            evidence = (
+                f"No matching SYN-ACK observed for "
+                f"{key[1]}:{key[3]} (SYN sequence {syn_seq})"
+            )
+        else:
+            alert_type = "Incomplete Handshake"
+            evidence = (
+                f"SYN-ACK observed, but final ACK not observed for "
+                f"{key[1]}:{key[3]} (SYN sequence {syn_seq})"
+            )
+
+        alerts.append({
+            "source": key[0],
+            "type": alert_type,
+            "severity": "MEDIUM",
+            "confidence": "MEDIUM",
+            "evidence": evidence
+        })
 
     # 4. Repeated SYN / retransmission candidates
     syn_groups = syns.groupby([
@@ -208,75 +306,86 @@ def detect_patterns(df):
 
 
 def calculate_metrics(df):
-    if df.empty:
-        return {
-            "total_packets": 0,
-            "initial_syn": 0,
-            "syn_ack": 0,
-            "completed_handshakes": 0,
-            "incomplete_handshakes": 0,
-            "handshake_completion_rate": 0.0,
-            "incomplete_handshake_rate": 0.0,
-            "retransmission_candidates": 0,
-        }
+    """Calculate network-wide statistics and TCP-only handshake metrics."""
 
-    syns = df[df["syn"] & ~df["ack_flag"]]
-    synacks = df[df["syn"] & df["ack_flag"]]
+    total_packets = len(df)
 
-    # Unique initial SYN flow count
-    unique_flows = syns.drop_duplicates([
-        "src_ip", "dst_ip", "src_port",
-        "dst_port", "seq"
-    ])
+    # Network-wide protocol and IP version statistics.
+    if "protocol" in df.columns:
+        tcp_df = _tcp_only(df)
+        tcp_packets = len(tcp_df)
+        udp_packets = int((df["protocol"] == "UDP").sum())
+    else:
+        # Backward compatibility with older test DataFrames.
+        tcp_df = df.copy()
+        tcp_packets = total_packets
+        udp_packets = 0
 
-    # Reuse detection output logic for handshake correlation
-    flows = {}
+    if "ip_version" in df.columns:
+        ipv4_packets = int((df["ip_version"] == 4).sum())
+        ipv6_packets = int((df["ip_version"] == 6).sum())
+    else:
+        ipv4_packets = 0
+        ipv6_packets = 0
 
-    for row in df.to_dict("records"):
-        key = (
-            row["src_ip"], row["dst_ip"],
-            row["src_port"], row["dst_port"]
-        )
-        reverse = (
-            row["dst_ip"], row["src_ip"],
-            row["dst_port"], row["src_port"]
-        )
+    network_metrics = {
+        "total_packets": total_packets,
+        "tcp_packets": tcp_packets,
+        "udp_packets": udp_packets,
+        "ipv4_packets": ipv4_packets,
+        "ipv6_packets": ipv6_packets,
+    }
 
-        if row["syn"] and not row["ack_flag"]:
-            flows.setdefault(key, {
-                "syn_seq": row["seq"],
-                "synack_seq": None,
-                "synack": False,
-                "complete": False,
-            })
+    tcp_metric_defaults = {
+        "initial_syn": 0,
+        "unique_initial_syn": 0,
+        "syn_ack": 0,
+        "completed_handshakes": 0,
+        "incomplete_handshakes": 0,
+        "unanswered_syn": 0,
+        "synack_without_final_ack": 0,
+        "pending_handshakes": 0,
+        "handshake_completion_rate": 0.0,
+        "incomplete_handshake_rate": 0.0,
+        "retransmission_candidates": 0,
+    }
 
-        elif row["syn"] and row["ack_flag"]:
-            flow = flows.get(reverse)
-            if flow and row["ack"] == flow["syn_seq"] + 1:
-                flow["synack"] = True
-                flow["synack_seq"] = row["seq"]
+    if tcp_df.empty:
+        return {**network_metrics, **tcp_metric_defaults}
 
-        elif row["ack_flag"] and not row["syn"]:
-            flow = flows.get(key)
-            if (
-                flow and flow["synack"]
-                and row["seq"] == flow["syn_seq"] + 1
-                and row["ack"] == flow["synack_seq"] + 1
-            ):
-                flow["complete"] = True
+    syns = tcp_df[tcp_df["syn"] & ~tcp_df["ack_flag"]]
+    synacks = tcp_df[tcp_df["syn"] & tcp_df["ack_flag"]]
 
-    completed = sum(
-        1 for f in flows.values() if f["complete"]
-    )
-    total = len(flows)
-    incomplete = max(0, total - completed)
+    sessions = _analyze_handshakes(tcp_df)
+    capture_end = tcp_df["timestamp"].max()
+
+    completed = 0
+    unanswered = 0
+    synack_without_final_ack = 0
+    pending = 0
+
+    for flow in sessions.values():
+        if flow["completed"]:
+            completed += 1
+            continue
+
+        elapsed = capture_end - flow["last_syn_time"]
+
+        if elapsed < HANDSHAKE_TIMEOUT:
+            pending += 1
+        elif flow["synack_time"] is None:
+            unanswered += 1
+        else:
+            synack_without_final_ack += 1
+
+    incomplete = unanswered + synack_without_final_ack
+    classified = completed + incomplete
 
     completion_rate = (
-        completed / total * 100 if total else 0
+        completed / classified * 100 if classified else 0.0
     )
-
     incomplete_rate = (
-        incomplete / total * 100 if total else 0
+        incomplete / classified * 100 if classified else 0.0
     )
 
     repeated = syns.duplicated(
@@ -287,17 +396,18 @@ def calculate_metrics(df):
         keep="first"
     ).sum()
 
-    return {
-        "total_packets": len(df),
+    tcp_metrics = {
         "initial_syn": len(syns),
+        "unique_initial_syn": len(sessions),
         "syn_ack": len(synacks),
         "completed_handshakes": completed,
         "incomplete_handshakes": incomplete,
-        "handshake_completion_rate": round(
-            completion_rate, 2
-        ),
-        "incomplete_handshake_rate": round(
-            incomplete_rate, 2
-        ),
+        "unanswered_syn": unanswered,
+        "synack_without_final_ack": synack_without_final_ack,
+        "pending_handshakes": pending,
+        "handshake_completion_rate": round(completion_rate, 2),
+        "incomplete_handshake_rate": round(incomplete_rate, 2),
         "retransmission_candidates": int(repeated),
     }
+
+    return {**network_metrics, **tcp_metrics}
